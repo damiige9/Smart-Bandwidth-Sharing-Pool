@@ -11,11 +11,16 @@
 (define-constant err-insufficient-balance (err u106))
 (define-constant err-invalid-sharing-rate (err u107))
 (define-constant err-reward-calculation-failed (err u108))
+(define-constant err-invalid-referrer (err u109))
+(define-constant err-self-referral (err u110))
+(define-constant err-referral-already-set (err u111))
 
 (define-data-var total-bandwidth-shared uint u0)
 (define-data-var total-pools uint u0)
 (define-data-var reward-rate uint u10)
 (define-data-var minimum-contribution uint u100)
+(define-data-var referral-bonus-percentage uint u10)
+(define-data-var minimum-referral-contribution uint u500)
 
 (define-private (min-uint (a uint) (b uint))
   (if (<= a b) a b)
@@ -59,6 +64,16 @@
   bool
 )
 
+(define-map user-referrals
+  principal
+  {
+    referrer: (optional principal),
+    total-referrals: uint,
+    referral-rewards: uint,
+    referral-set: bool
+  }
+)
+
 (define-public (register-user)
   (let
     (
@@ -74,6 +89,14 @@
         registration-height: current-height,
         is-active: true,
         reputation-score: u100
+      }
+    )
+    (map-set user-referrals user
+      {
+        referrer: none,
+        total-referrals: u0,
+        referral-rewards: u0,
+        referral-set: false
       }
     )
     (ok true)
@@ -157,6 +180,34 @@
       
       (var-set total-bandwidth-shared (+ (var-get total-bandwidth-shared) bandwidth-amount))
       (try! (ft-mint? bandwidth-token reward-amount user))
+      
+      (let
+        (
+          (user-referral-data (unwrap! (map-get? user-referrals user) err-user-not-found))
+          (referrer-opt (get referrer user-referral-data))
+        )
+        (match referrer-opt
+          referrer-principal
+          (let
+            (
+              (referrer-data (unwrap! (map-get? user-referrals referrer-principal) err-invalid-referrer))
+              (referral-bonus (/ (* reward-amount (var-get referral-bonus-percentage)) u100))
+            )
+            (if (>= bandwidth-amount (var-get minimum-referral-contribution))
+              (begin
+                (try! (ft-mint? bandwidth-token referral-bonus referrer-principal))
+                (map-set user-referrals referrer-principal
+                  (merge referrer-data { referral-rewards: (+ (get referral-rewards referrer-data) referral-bonus) })
+                )
+                true
+              )
+              true
+            )
+          )
+          true
+        )
+      )
+      
       (ok reward-amount)
     )
   )
@@ -221,6 +272,39 @@
   )
 )
 
+(define-public (set-referrer (referrer-principal principal))
+  (let
+    (
+      (user tx-sender)
+      (user-referral-data (unwrap! (map-get? user-referrals user) err-user-not-found))
+      (referrer-profile (unwrap! (map-get? user-profiles referrer-principal) err-invalid-referrer))
+      (referrer-data (unwrap! (map-get? user-referrals referrer-principal) err-invalid-referrer))
+    )
+    (asserts! (not (is-eq user referrer-principal)) err-self-referral)
+    (asserts! (not (get referral-set user-referral-data)) err-referral-already-set)
+    (asserts! (get is-active referrer-profile) err-invalid-referrer)
+    
+    (map-set user-referrals user
+      (merge user-referral-data
+        {
+          referrer: (some referrer-principal),
+          referral-set: true
+        }
+      )
+    )
+    
+    (map-set user-referrals referrer-principal
+      (merge referrer-data
+        {
+          total-referrals: (+ (get total-referrals referrer-data) u1)
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
 (define-public (deactivate-pool (pool-id uint))
   (let
     (
@@ -258,6 +342,14 @@
 
 (define-read-only (is-pool-member (pool-id uint) (user principal))
   (default-to false (map-get? pool-members { pool-id: pool-id, member: user }))
+)
+
+(define-read-only (get-referral-info (user principal))
+  (map-get? user-referrals user)
+)
+
+(define-read-only (get-referral-bonus-percentage)
+  (var-get referral-bonus-percentage)
 )
 
 (define-read-only (calculate-user-efficiency (user principal))
