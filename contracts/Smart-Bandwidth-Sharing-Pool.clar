@@ -14,6 +14,11 @@
 (define-constant err-invalid-referrer (err u109))
 (define-constant err-self-referral (err u110))
 (define-constant err-referral-already-set (err u111))
+(define-constant err-lease-not-found (err u112))
+(define-constant err-lease-expired (err u113))
+(define-constant err-lease-active (err u114))
+(define-constant err-insufficient-lease-balance (err u115))
+(define-constant err-invalid-duration (err u116))
 
 (define-data-var total-bandwidth-shared uint u0)
 (define-data-var total-pools uint u0)
@@ -21,6 +26,9 @@
 (define-data-var minimum-contribution uint u100)
 (define-data-var referral-bonus-percentage uint u10)
 (define-data-var minimum-referral-contribution uint u500)
+(define-data-var total-leases uint u0)
+(define-data-var minimum-lease-duration uint u144)
+(define-data-var maximum-lease-duration uint u52560)
 
 (define-private (min-uint (a uint) (b uint))
   (if (<= a b) a b)
@@ -72,6 +80,26 @@
     referral-rewards: uint,
     referral-set: bool
   }
+)
+
+(define-map bandwidth-leases
+  uint
+  {
+    lessor: principal,
+    lessee: (optional principal),
+    bandwidth-amount: uint,
+    rate-per-mb: uint,
+    start-height: uint,
+    duration-blocks: uint,
+    total-cost: uint,
+    is-active: bool,
+    pool-id: uint
+  }
+)
+
+(define-map user-active-leases
+  { user: principal, lease-id: uint }
+  bool
 )
 
 (define-public (register-user)
@@ -367,6 +395,147 @@
           (/ (* contributed u100) consumed)
         )
       )
+    )
+    u0
+  )
+)
+
+(define-public (create-bandwidth-lease (pool-id uint) (bandwidth-amount uint) (rate-per-mb uint) (duration-blocks uint))
+  (let
+    (
+      (user tx-sender)
+      (current-height stacks-block-height)
+      (lease-id (+ (var-get total-leases) u1))
+      (user-profile (unwrap! (map-get? user-profiles user) err-user-not-found))
+      (pool (unwrap! (map-get? bandwidth-pools pool-id) err-pool-not-found))
+      (contribution (unwrap! (map-get? user-pool-contributions { user: user, pool-id: pool-id }) err-user-not-found))
+    )
+    (asserts! (> bandwidth-amount u0) err-invalid-amount)
+    (asserts! (> rate-per-mb u0) err-invalid-amount)
+    (asserts! (>= duration-blocks (var-get minimum-lease-duration)) err-invalid-duration)
+    (asserts! (<= duration-blocks (var-get maximum-lease-duration)) err-invalid-duration)
+    (asserts! (get is-active pool) err-pool-not-found)
+    (asserts! (<= bandwidth-amount (get bandwidth-shared contribution)) err-insufficient-bandwidth)
+    
+    (let
+      (
+        (total-cost (* bandwidth-amount rate-per-mb))
+      )
+      (map-set bandwidth-leases lease-id
+        {
+          lessor: user,
+          lessee: none,
+          bandwidth-amount: bandwidth-amount,
+          rate-per-mb: rate-per-mb,
+          start-height: current-height,
+          duration-blocks: duration-blocks,
+          total-cost: total-cost,
+          is-active: true,
+          pool-id: pool-id
+        }
+      )
+      
+      (map-set user-active-leases { user: user, lease-id: lease-id } true)
+      (var-set total-leases lease-id)
+      (ok lease-id)
+    )
+  )
+)
+
+(define-public (accept-bandwidth-lease (lease-id uint))
+  (let
+    (
+      (user tx-sender)
+      (current-height stacks-block-height)
+      (lease (unwrap! (map-get? bandwidth-leases lease-id) err-lease-not-found))
+      (user-profile (unwrap! (map-get? user-profiles user) err-user-not-found))
+    )
+    (asserts! (get is-active lease) err-lease-not-found)
+    (asserts! (is-none (get lessee lease)) err-lease-active)
+    (asserts! (not (is-eq user (get lessor lease))) err-self-referral)
+    (asserts! (<= (+ (get start-height lease) (get duration-blocks lease)) (+ current-height (get duration-blocks lease))) err-lease-expired)
+    (asserts! (>= (ft-get-balance bandwidth-token user) (get total-cost lease)) err-insufficient-balance)
+    
+    (try! (ft-transfer? bandwidth-token (get total-cost lease) user (get lessor lease)))
+    
+    (map-set bandwidth-leases lease-id
+      (merge lease { lessee: (some user) })
+    )
+    
+    (map-set user-active-leases { user: user, lease-id: lease-id } true)
+    (ok true)
+  )
+)
+
+(define-public (terminate-lease (lease-id uint))
+  (let
+    (
+      (user tx-sender)
+      (current-height stacks-block-height)
+      (lease (unwrap! (map-get? bandwidth-leases lease-id) err-lease-not-found))
+    )
+    (asserts! (get is-active lease) err-lease-not-found)
+    (asserts! (or (is-eq user (get lessor lease)) (> current-height (+ (get start-height lease) (get duration-blocks lease)))) err-owner-only)
+    
+    (map-set bandwidth-leases lease-id
+      (merge lease { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (withdraw-expired-bandwidth (lease-id uint))
+  (let
+    (
+      (user tx-sender)
+      (current-height stacks-block-height)
+      (lease (unwrap! (map-get? bandwidth-leases lease-id) err-lease-not-found))
+    )
+    (asserts! (is-eq user (get lessor lease)) err-owner-only)
+    (asserts! (not (get is-active lease)) err-lease-active)
+    (asserts! (> current-height (+ (get start-height lease) (get duration-blocks lease))) err-lease-active)
+    
+    (ok (get bandwidth-amount lease))
+  )
+)
+
+(define-read-only (get-lease-info (lease-id uint))
+  (map-get? bandwidth-leases lease-id)
+)
+
+(define-read-only (is-lease-active (lease-id uint))
+  (match (map-get? bandwidth-leases lease-id)
+    lease
+    (let
+      (
+        (current-height stacks-block-height)
+        (expiry-height (+ (get start-height lease) (get duration-blocks lease)))
+      )
+      (and (get is-active lease) (<= current-height expiry-height))
+    )
+    false
+  )
+)
+
+(define-read-only (get-user-lease-status (user principal) (lease-id uint))
+  (default-to false (map-get? user-active-leases { user: user, lease-id: lease-id }))
+)
+
+(define-read-only (get-total-leases)
+  (var-get total-leases)
+)
+
+(define-read-only (calculate-lease-value (lease-id uint))
+  (match (map-get? bandwidth-leases lease-id)
+    lease
+    (let
+      (
+        (current-height stacks-block-height)
+        (expiry-height (+ (get start-height lease) (get duration-blocks lease)))
+        (blocks-remaining (if (> expiry-height current-height) (- expiry-height current-height) u0))
+      )
+      (* (get bandwidth-amount lease) blocks-remaining)
     )
     u0
   )
